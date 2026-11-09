@@ -119,9 +119,9 @@ pub fn validate_addons_path(path: &Path) -> std::result::Result<(), String> {
 
     if !parts
         .iter()
-        .any(|part| part.eq_ignore_ascii_case("_retail_"))
+        .any(|part| part.eq_ignore_ascii_case("_retail_") || part.eq_ignore_ascii_case("_forever_"))
     {
-        return Err("path must point to a retail WoW AddOns folder".to_string());
+        return Err("path must point to a retail or WoW Forever AddOns folder".to_string());
     }
     if !parts
         .iter()
@@ -376,6 +376,32 @@ mod tests {
         let addons = create_wow_install(temp.path());
 
         assert!(validate_addons_path(&addons).is_ok());
+    }
+
+    #[test]
+    fn validates_a_wow_forever_addons_path() {
+        let temp = tempdir().expect("tempdir");
+        let wow_root = temp.path().join("World of Warcraft");
+        let forever = wow_root.join("_forever_");
+        let addons = forever.join("Interface").join("AddOns");
+        fs::create_dir_all(wow_root.join("Data")).expect("create Data");
+        fs::create_dir_all(&addons).expect("create addons dir");
+        fs::write(forever.join("Wow.exe"), "wow").expect("write Wow.exe");
+
+        assert!(validate_addons_path(&addons).is_ok());
+    }
+
+    #[test]
+    fn rejects_an_unknown_client_folder() {
+        let temp = tempdir().expect("tempdir");
+        let wow_root = temp.path().join("World of Warcraft");
+        let other = wow_root.join("_ptr_");
+        let addons = other.join("Interface").join("AddOns");
+        fs::create_dir_all(wow_root.join("Data")).expect("create Data");
+        fs::create_dir_all(&addons).expect("create addons dir");
+        fs::write(other.join("Wow.exe"), "wow").expect("write Wow.exe");
+
+        assert!(validate_addons_path(&addons).is_err());
     }
 
     #[test]

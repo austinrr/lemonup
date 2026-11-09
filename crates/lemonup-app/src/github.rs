@@ -61,7 +61,32 @@ struct GithubRepoMetadata {
 #[derive(Debug, Clone, PartialEq, Eq)]
 struct GithubResolvedRepo {
     metadata: GithubRepoMetadata,
+    /// The commit being installed: the latest release's tag commit when a
+    /// release asset is used, otherwise the default branch head.
     head_sha: String,
+    package: GithubPackage,
+}
+
+/// What gets downloaded for a resolved repo.
+#[derive(Debug, Clone, PartialEq, Eq)]
+enum GithubPackage {
+    /// A packaged zip attached to the latest release.
+    ReleaseAsset { tag: String, download_url: String },
+    /// The repo source at `head_sha`.
+    Source,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, Deserialize)]
+struct GithubReleaseResponse {
+    tag_name: String,
+    #[serde(default)]
+    assets: Vec<GithubReleaseAsset>,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, Deserialize)]
+struct GithubReleaseAsset {
+    name: String,
+    browser_download_url: String,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq, Deserialize)]
@@ -108,8 +133,9 @@ pub(crate) async fn install_github_addon(
 ) -> Result<GithubInstallSummary, String> {
     let repo = parse_github_repo_url(target)?;
     let client = build_github_client()?;
-    let resolved = fetch_github_repo(&client, &repo).await?;
-    let bytes = download_github_zipball_bytes(&client, &resolved).await?;
+    let flavor = GameFlavor::from_addons_dir(addon_dir);
+    let resolved = fetch_github_repo(&client, &repo, flavor).await?;
+    let bytes = download_github_package_bytes(&client, &resolved).await?;
     install_downloaded_github_addon(state_database, addon_dir, &resolved, &bytes, dry_run)
 }
 
@@ -118,7 +144,7 @@ pub(crate) async fn fetch_github_remote_version(
 ) -> Result<GithubRemoteVersion, String> {
     let repo = resolve_tracked_github_repo(addon)?;
     let client = build_github_client()?;
-    let resolved = fetch_github_repo(&client, &repo).await?;
+    let resolved = fetch_github_repo(&client, &repo, addon.flavor).await?;
     Ok(GithubRemoteVersion {
         source_url: Some(resolved.metadata.html_url),
         version: Some(resolved.head_sha),
@@ -141,7 +167,8 @@ pub(crate) async fn update_github_addon(
 
     let repo = resolve_tracked_github_repo(tracked)?;
     let client = build_github_client()?;
-    let resolved = fetch_github_repo(&client, &repo).await?;
+    // the same flavor the update check resolved with, so both pick the same package
+    let resolved = fetch_github_repo(&client, &repo, tracked.flavor).await?;
     let remote_version = Some(resolved.head_sha.clone());
     let installed_commit = tracked.git_commit.as_deref().or(tracked.version.as_deref());
 
@@ -161,7 +188,7 @@ pub(crate) async fn update_github_addon(
         });
     }
 
-    let bytes = download_github_zipball_bytes(&client, &resolved).await?;
+    let bytes = download_github_package_bytes(&client, &resolved).await?;
     update_downloaded_github_addon(
         state_database,
         addon_dir,
@@ -182,10 +209,153 @@ fn build_github_client() -> Result<Client, String> {
 async fn fetch_github_repo(
     client: &Client,
     repo: &GithubRepoRef,
+    flavor: GameFlavor,
 ) -> Result<GithubResolvedRepo, String> {
     let metadata = fetch_github_repo_metadata(client, repo).await?;
-    let head_sha = fetch_github_head_commit(client, &metadata).await?;
-    Ok(GithubResolvedRepo { metadata, head_sha })
+
+    // A packaged release zip is what the author meant players to install (its
+    // version filled in, only its own client's files), so prefer it to the source.
+    if let Some(release) = fetch_github_latest_release(client, &metadata).await?
+        && let Some(asset) = select_release_asset(&release.assets, flavor)
+    {
+        let download_url = asset.browser_download_url.clone();
+        let head_sha = fetch_github_commit(client, &metadata, &release.tag_name).await?;
+        return Ok(GithubResolvedRepo {
+            metadata,
+            head_sha,
+            package: GithubPackage::ReleaseAsset {
+                tag: release.tag_name,
+                download_url,
+            },
+        });
+    }
+
+    let default_branch = metadata.default_branch.clone();
+    let head_sha = fetch_github_commit(client, &metadata, &default_branch).await?;
+    Ok(GithubResolvedRepo {
+        metadata,
+        head_sha,
+        package: GithubPackage::Source,
+    })
+}
+
+/// The latest non-draft, non-prerelease release, or `None` when there isn't one.
+async fn fetch_github_latest_release(
+    client: &Client,
+    metadata: &GithubRepoMetadata,
+) -> Result<Option<GithubReleaseResponse>, String> {
+    let url = github_api_url(&[
+        "repos",
+        &metadata.owner,
+        &metadata.repo,
+        "releases",
+        "latest",
+    ])?;
+    let response = client
+        .get(url)
+        .header(reqwest::header::ACCEPT, "application/vnd.github+json")
+        .send()
+        .await
+        .map_err(|error| error.to_string())?;
+
+    if response.status() == StatusCode::NOT_FOUND {
+        return Ok(None);
+    }
+
+    let response = response
+        .error_for_status()
+        .map_err(|error| error.to_string())?;
+    response
+        .json::<GithubReleaseResponse>()
+        .await
+        .map(Some)
+        .map_err(|error| error.to_string())
+}
+
+/// Picks the release zip for `flavor`: one named for it (`Addon-1.0-forever.zip`),
+/// else the only zip named for no flavor at all. `None` means install the source.
+fn select_release_asset(
+    assets: &[GithubReleaseAsset],
+    flavor: GameFlavor,
+) -> Option<&GithubReleaseAsset> {
+    let zips = assets
+        .iter()
+        .filter(|asset| asset.name.to_ascii_lowercase().ends_with(".zip"))
+        .filter(|asset| {
+            asset
+                .browser_download_url
+                .starts_with("https://github.com/")
+        })
+        .filter(|asset| !asset_name_tokens(&asset.name).any(|token| token == "nolib"))
+        .collect::<Vec<_>>();
+
+    if let Some(own) = zips
+        .iter()
+        .find(|asset| asset_flavors(&asset.name).contains(&flavor_asset_key(flavor)))
+    {
+        return Some(own);
+    }
+
+    let unmarked = zips
+        .iter()
+        .filter(|asset| asset_flavors(&asset.name).is_empty())
+        .collect::<Vec<_>>();
+    match unmarked.as_slice() {
+        [only] => Some(only),
+        _ => None,
+    }
+}
+
+fn asset_name_tokens(name: &str) -> impl Iterator<Item = String> + '_ {
+    name.split(|character: char| !character.is_ascii_alphanumeric())
+        .filter(|token| !token.is_empty())
+        .map(|token| token.to_ascii_lowercase())
+}
+
+/// The clients an asset name is marked for. Clients LemonUp has no flavor for
+/// (wrath, tbc, mists ...) still count, so their zips are never taken as unmarked.
+fn asset_flavors(name: &str) -> Vec<&'static str> {
+    let mut flavors = Vec::new();
+    for token in asset_name_tokens(name) {
+        let flavor = match token.as_str() {
+            "retail" | "mainline" => "retail",
+            "classic" | "vanilla" | "era" => "classic",
+            "cata" | "cataclysm" => "cata",
+            "forever" => "forever",
+            "wrath" | "wotlk" | "wotlkc" => "wrath",
+            "tbc" | "bcc" | "tbcc" => "tbc",
+            "mists" | "mop" => "mists",
+            _ => continue,
+        };
+        if !flavors.contains(&flavor) {
+            flavors.push(flavor);
+        }
+    }
+    flavors
+}
+
+fn flavor_asset_key(flavor: GameFlavor) -> &'static str {
+    match flavor {
+        GameFlavor::Retail => "retail",
+        GameFlavor::Classic => "classic",
+        GameFlavor::Cata => "cata",
+        GameFlavor::Forever => "forever",
+    }
+}
+
+/// A ref like "release/1.2" stays slash-separated rather than becoming "release%2F1.2".
+fn github_commit_url(owner: &str, repo: &str, git_ref: &str) -> Result<Url, String> {
+    let mut segments = vec!["repos", owner, repo, "commits"];
+    segments.extend(git_ref.split('/').filter(|part| !part.is_empty()));
+    github_api_url(&segments)
+}
+
+fn github_api_url(segments: &[&str]) -> Result<Url, String> {
+    let mut url = Url::parse(API_BASE).map_err(|error| error.to_string())?;
+    url.path_segments_mut()
+        .map_err(|_| "GitHub API base URL cannot take a path".to_string())?
+        .extend(segments);
+    Ok(url)
 }
 
 async fn fetch_github_repo_metadata(
@@ -224,14 +394,13 @@ async fn fetch_github_repo_metadata(
     })
 }
 
-async fn fetch_github_head_commit(
+/// The commit a branch or tag (`git_ref`) points to.
+async fn fetch_github_commit(
     client: &Client,
     metadata: &GithubRepoMetadata,
+    git_ref: &str,
 ) -> Result<String, String> {
-    let url = format!(
-        "{API_BASE}/repos/{}/{}/commits/{}",
-        metadata.owner, metadata.repo, metadata.default_branch
-    );
+    let url = github_commit_url(&metadata.owner, &metadata.repo, git_ref)?;
     let response = client
         .get(url)
         .header(reqwest::header::ACCEPT, "application/vnd.github+json")
@@ -241,8 +410,8 @@ async fn fetch_github_head_commit(
 
     if response.status() == StatusCode::NOT_FOUND {
         return Err(format!(
-            "GitHub repo '{}/{}' is missing default branch '{}'",
-            metadata.owner, metadata.repo, metadata.default_branch
+            "GitHub repo '{}/{}' is missing '{}'",
+            metadata.owner, metadata.repo, git_ref
         ));
     }
 
@@ -256,14 +425,22 @@ async fn fetch_github_head_commit(
     Ok(parsed.sha)
 }
 
-async fn download_github_zipball_bytes(
+async fn download_github_package_bytes(
     client: &Client,
     resolved: &GithubResolvedRepo,
 ) -> Result<Vec<u8>, String> {
-    let url = format!(
-        "{API_BASE}/repos/{}/{}/zipball/{}",
-        resolved.metadata.owner, resolved.metadata.repo, resolved.head_sha
-    );
+    let url = match &resolved.package {
+        GithubPackage::ReleaseAsset { download_url, .. } => {
+            Url::parse(download_url).map_err(|error| error.to_string())?
+        }
+        GithubPackage::Source => github_api_url(&[
+            "repos",
+            &resolved.metadata.owner,
+            &resolved.metadata.repo,
+            "zipball",
+            &resolved.head_sha,
+        ])?,
+    };
     client
         .get(url)
         .send()
@@ -293,8 +470,11 @@ fn install_downloaded_github_addon(
 
         let extracted = discover_extracted_folders(&extract_root)?;
         let parent_folder = determine_parent_folder(&extracted.folders, &resolved.metadata.repo)?;
-        let scanned = scan_addons_dir(&extracted.source_root, GameFlavor::Retail)
-            .map_err(|error| error.to_string())?;
+        let scanned = scan_addons_dir(
+            &extracted.source_root,
+            GameFlavor::from_addons_dir(addon_dir),
+        )
+        .map_err(|error| error.to_string())?;
         let parent_metadata = scanned
             .iter()
             .find(|candidate| candidate.folder == parent_folder)
@@ -311,7 +491,7 @@ fn install_downloaded_github_addon(
                 repo_name: resolved.metadata.repo.clone(),
                 parent_folder,
                 installed_folders: extracted.folders,
-                version: install_version(parent_metadata.version.as_deref(), &resolved.head_sha),
+                version: install_version(parent_metadata.version.as_deref(), resolved),
                 git_commit: resolved.head_sha.clone(),
                 dry_run: true,
             });
@@ -337,7 +517,7 @@ fn install_downloaded_github_addon(
             repo_name: resolved.metadata.repo.clone(),
             parent_folder,
             installed_folders: extracted.folders,
-            version: install_version(parent_metadata.version.as_deref(), &resolved.head_sha),
+            version: install_version(parent_metadata.version.as_deref(), resolved),
             git_commit: resolved.head_sha.clone(),
             dry_run: false,
         })
@@ -375,8 +555,11 @@ fn update_downloaded_github_addon(
             ));
         }
 
-        let scanned = scan_addons_dir(&extracted.source_root, GameFlavor::Retail)
-            .map_err(|error| error.to_string())?;
+        let scanned = scan_addons_dir(
+            &extracted.source_root,
+            GameFlavor::from_addons_dir(addon_dir),
+        )
+        .map_err(|error| error.to_string())?;
         let parent_metadata = scanned
             .iter()
             .find(|candidate| candidate.folder == tracked.folder)
@@ -466,7 +649,7 @@ fn build_managed_github_record(
     );
     record.kind = parent_metadata.kind;
     record.flavor = parent_metadata.flavor;
-    record.version = install_version(parent_metadata.version.as_deref(), &resolved.head_sha);
+    record.version = install_version(parent_metadata.version.as_deref(), resolved);
     record.git_commit = Some(resolved.head_sha.clone());
     record.author = parent_metadata
         .author
@@ -677,11 +860,14 @@ fn normalize_folder_like(value: &str) -> String {
         .to_ascii_lowercase()
 }
 
-fn install_version(parent_version: Option<&str>, commit: &str) -> Option<String> {
+fn install_version(parent_version: Option<&str>, resolved: &GithubResolvedRepo) -> Option<String> {
     parent_version
         .filter(|value| !is_placeholder_version(value))
         .map(ToOwned::to_owned)
-        .or_else(|| Some(short_commit(commit)))
+        .or_else(|| match &resolved.package {
+            GithubPackage::ReleaseAsset { tag, .. } => Some(tag.clone()),
+            GithubPackage::Source => Some(short_commit(&resolved.head_sha)),
+        })
 }
 
 fn is_placeholder_version(value: &str) -> bool {
@@ -925,6 +1111,7 @@ mod tests {
                 owner_login: "AdiAddons".to_string(),
             },
             head_sha: "abcdef0123456789".to_string(),
+            package: super::GithubPackage::Source,
         };
         let scanned = ScannedAddon {
             name: "AdiBags".to_string(),
@@ -965,6 +1152,7 @@ mod tests {
                 owner_login: "WeakAuras".to_string(),
             },
             head_sha: "364f625cf8c4f2f1c0785ab12da2121e880ec560".to_string(),
+            package: super::GithubPackage::Source,
         };
         let scanned = ScannedAddon {
             name: "WeakAuras".to_string(),
@@ -1034,6 +1222,7 @@ mod tests {
                 owner_login: "AdiAddons".to_string(),
             },
             head_sha: "abcdef0123456789".to_string(),
+            package: super::GithubPackage::Source,
         };
         let bytes = build_zip(&[(
             "wrapper/AdiBags/AdiBags.toc",
@@ -1057,5 +1246,133 @@ mod tests {
             .expect("get addon")
             .expect("addon exists");
         assert_eq!(stored.git_commit.as_deref(), Some("abcdef0"));
+    }
+
+    fn asset(name: &str) -> super::GithubReleaseAsset {
+        super::GithubReleaseAsset {
+            name: name.to_string(),
+            browser_download_url: format!(
+                "https://github.com/owner/repo/releases/download/v1/{name}"
+            ),
+        }
+    }
+
+    fn selected(names: &[&str], flavor: GameFlavor) -> Option<String> {
+        let assets = names.iter().map(|name| asset(name)).collect::<Vec<_>>();
+        super::select_release_asset(&assets, flavor).map(|picked| picked.name.clone())
+    }
+
+    #[test]
+    fn select_release_asset_prefers_the_zip_named_for_the_flavor() {
+        let names = ["OpenMap-v0.8.2-retail.zip", "OpenMap-v0.8.2-forever.zip"];
+        assert_eq!(
+            selected(&names, GameFlavor::Forever).as_deref(),
+            Some("OpenMap-v0.8.2-forever.zip")
+        );
+        assert_eq!(
+            selected(&names, GameFlavor::Retail).as_deref(),
+            Some("OpenMap-v0.8.2-retail.zip")
+        );
+    }
+
+    #[test]
+    fn select_release_asset_takes_a_single_unmarked_zip_and_ignores_other_files() {
+        let names = ["release.json", "Baganator-845.zip"];
+        assert_eq!(
+            selected(&names, GameFlavor::Forever).as_deref(),
+            Some("Baganator-845.zip")
+        );
+    }
+
+    #[test]
+    fn select_release_asset_falls_back_to_source_when_nothing_fits() {
+        // only other flavors' zips
+        assert_eq!(
+            selected(&["OpenMap-v1-retail.zip"], GameFlavor::Forever),
+            None
+        );
+        // no zips at all
+        assert_eq!(selected(&["release.json"], GameFlavor::Retail), None);
+        // several unmarked zips: no way to tell which is meant
+        assert_eq!(selected(&["A-1.zip", "B-1.zip"], GameFlavor::Retail), None);
+    }
+
+    #[test]
+    fn select_release_asset_skips_nolib_and_non_github_downloads() {
+        let mut assets = vec![asset("Addon-1.0-nolib.zip"), asset("Addon-1.0.zip")];
+        assert_eq!(
+            super::select_release_asset(&assets, GameFlavor::Retail).map(|a| a.name.as_str()),
+            Some("Addon-1.0.zip")
+        );
+        assets[1].browser_download_url = "https://example.com/Addon-1.0.zip".to_string();
+        assert_eq!(
+            super::select_release_asset(&assets, GameFlavor::Retail),
+            None
+        );
+    }
+
+    #[test]
+    fn select_release_asset_never_takes_another_clients_zip_as_unmarked() {
+        // a lone zip for a client LemonUp has no flavor for isn't a generic build
+        assert_eq!(
+            selected(&["Addon-1.0-wrath.zip"], GameFlavor::Forever),
+            None
+        );
+        assert_eq!(selected(&["Addon-1.0-mists.zip"], GameFlavor::Retail), None);
+        // the packager layout: the one unmarked zip is the generic build
+        let names = ["Addon-1.0.zip", "Addon-1.0-bcc.zip", "Addon-1.0-wrath.zip"];
+        assert_eq!(
+            selected(&names, GameFlavor::Retail).as_deref(),
+            Some("Addon-1.0.zip")
+        );
+    }
+
+    #[test]
+    fn commit_url_keeps_slashes_in_refs() {
+        let url = super::github_commit_url("owner", "repo", "release/1.2").expect("url");
+        assert_eq!(
+            url.as_str(),
+            "https://api.github.com/repos/owner/repo/commits/release/1.2"
+        );
+        let url = super::github_commit_url("owner", "repo", "v0.8.2").expect("url");
+        assert_eq!(
+            url.as_str(),
+            "https://api.github.com/repos/owner/repo/commits/v0.8.2"
+        );
+    }
+
+    #[test]
+    fn select_release_asset_matches_flavor_words_not_substrings() {
+        // "era" inside "Camera" isn't the Classic Era flavor
+        assert_eq!(
+            selected(&["Camera-2.0.zip"], GameFlavor::Retail).as_deref(),
+            Some("Camera-2.0.zip")
+        );
+    }
+
+    #[test]
+    fn install_version_falls_back_to_the_release_tag() {
+        let resolved = super::GithubResolvedRepo {
+            metadata: super::GithubRepoMetadata {
+                owner: "openmap-world".to_string(),
+                repo: "openmap".to_string(),
+                default_branch: "main".to_string(),
+                html_url: "https://github.com/openmap-world/openmap".to_string(),
+                owner_login: "openmap-world".to_string(),
+            },
+            head_sha: "cea294cd7be86bc0bbedc078cdb48aa4b683bfef".to_string(),
+            package: super::GithubPackage::ReleaseAsset {
+                tag: "v0.8.2".to_string(),
+                download_url: "https://github.com/openmap-world/openmap/releases/download/v0.8.2/OpenMap-v0.8.2-forever.zip".to_string(),
+            },
+        };
+        assert_eq!(
+            super::install_version(Some("@project-version@"), &resolved).as_deref(),
+            Some("v0.8.2")
+        );
+        assert_eq!(
+            super::install_version(Some("v0.8.2"), &resolved).as_deref(),
+            Some("v0.8.2")
+        );
     }
 }

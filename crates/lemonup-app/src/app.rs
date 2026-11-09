@@ -6944,8 +6944,8 @@ fn sync_dashboard_state(
     state_db_file: &Path,
     addon_dir: &Path,
 ) -> std::result::Result<AddonScanOutcome, String> {
-    let scanned =
-        scan_addons_dir(addon_dir, GameFlavor::Retail).map_err(|error| error.to_string())?;
+    let scanned = scan_addons_dir(addon_dir, GameFlavor::from_addons_dir(addon_dir))
+        .map_err(|error| error.to_string())?;
     let mut database = StateDatabase::open(state_db_file).map_err(|error| error.to_string())?;
     let tracked = database.list_addons().map_err(|error| error.to_string())?;
     let drift_report = compute_drift_report(&tracked, &scanned);
@@ -9555,7 +9555,7 @@ mod tests {
         let view = app.dashboard_table_row(row);
         let rendered = view.version.to_string();
         assert!(rendered.contains("⠋"));
-        assert!(rendered.contains("abcdef"));
+        assert!(rendered.contains("2.0.0"));
     }
 
     #[test]
@@ -9647,6 +9647,17 @@ mod tests {
 
         let item = dashboard.items.first().expect("dashboard item");
         assert_eq!(dashboard_item_version_label(item), "1234567");
+    }
+
+    #[test]
+    fn github_version_label_prefers_a_release_version_over_its_commit() {
+        let mut addon = AddonRecord::new("OpenMap", "OpenMap", SourceKind::GitHub);
+        addon.version = Some("v0.8.2".to_string());
+        addon.git_commit = Some("cea294cd7be86bc0bbedc078cdb48aa4b683bfef".to_string());
+        let dashboard = DashboardState::from_addons(vec![addon]);
+
+        let item = dashboard.items.first().expect("dashboard item");
+        assert_eq!(dashboard_item_version_label(item), "v0.8.2");
     }
 
     #[test]

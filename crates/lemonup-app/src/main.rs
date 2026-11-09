@@ -302,7 +302,7 @@ fn run_sync(paths: AppPaths, runtime: AppRuntime) -> Result<(), Box<dyn std::err
                 Box::new(LemonupError::InvalidArgument(error)) as Box<dyn std::error::Error>
             })?;
 
-            let scanned = scan_addons_dir(&addon_dir, GameFlavor::Retail)?;
+            let scanned = scan_addons_dir(&addon_dir, GameFlavor::from_addons_dir(&addon_dir))?;
             let mut database = StateDatabase::open(paths.state_db_file)?;
             let summary = database.reconcile_scanned_addons(&scanned)?;
 

@@ -456,8 +456,11 @@ fn install_downloaded_wago_addon(
 
         let extracted = discover_extracted_folders(&extract_root)?;
         let parent_folder = determine_parent_folder(&extracted.folders, &addon.display_name)?;
-        let scanned = scan_addons_dir(&extracted.source_root, GameFlavor::Retail)
-            .map_err(|error| error.to_string())?;
+        let scanned = scan_addons_dir(
+            &extracted.source_root,
+            GameFlavor::from_addons_dir(addon_dir),
+        )
+        .map_err(|error| error.to_string())?;
         let parent_metadata = scanned
             .iter()
             .find(|candidate| candidate.folder == parent_folder)
@@ -598,8 +601,11 @@ fn update_downloaded_wago_addon(
             ));
         }
 
-        let scanned = scan_addons_dir(&extracted.source_root, GameFlavor::Retail)
-            .map_err(|error| error.to_string())?;
+        let scanned = scan_addons_dir(
+            &extracted.source_root,
+            GameFlavor::from_addons_dir(addon_dir),
+        )
+        .map_err(|error| error.to_string())?;
         let parent_metadata = scanned
             .iter()
             .find(|candidate| candidate.folder == tracked.folder)

@@ -623,6 +623,7 @@ fn parse_flavor(value: &str) -> rusqlite::Result<GameFlavor> {
         "retail" => Ok(GameFlavor::Retail),
         "classic" => Ok(GameFlavor::Classic),
         "cata" => Ok(GameFlavor::Cata),
+        "forever" => Ok(GameFlavor::Forever),
         _ => Err(rusqlite::Error::InvalidQuery),
     }
 }
@@ -658,6 +659,7 @@ fn serialize_flavor(value: GameFlavor) -> &'static str {
         GameFlavor::Retail => "retail",
         GameFlavor::Classic => "classic",
         GameFlavor::Cata => "cata",
+        GameFlavor::Forever => "forever",
     }
 }
 

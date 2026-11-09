@@ -296,6 +296,14 @@ pub(super) fn dashboard_row_name_line(row: &DashboardRow, selected: bool) -> Lin
 pub(super) fn dashboard_item_version_label(item: &DashboardItem) -> String {
     match item.source {
         SourceKind::GitHub => {
+            // a real version (a release's "v0.8.2") reads better than its commit
+            if let Some(version) = item
+                .version
+                .as_deref()
+                .filter(|value| !is_placeholder_version(value) && !looks_like_commit_hash(value))
+            {
+                return version.to_string();
+            }
             if let Some(commit) = item.git_commit.as_deref() {
                 return shorten_commit(commit);
             }

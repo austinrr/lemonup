@@ -247,8 +247,11 @@ fn install_downloaded_wowinterface_addon(
         let target_name = addon.ui_file_name.trim_end_matches(".zip");
         let parent_folder =
             determine_parent_folder(&extracted.folders, target_name, Some(&addon.ui_name))?;
-        let scanned = scan_addons_dir(&extracted.source_root, GameFlavor::Retail)
-            .map_err(|error| error.to_string())?;
+        let scanned = scan_addons_dir(
+            &extracted.source_root,
+            GameFlavor::from_addons_dir(addon_dir),
+        )
+        .map_err(|error| error.to_string())?;
         let parent_metadata = scanned
             .iter()
             .find(|candidate| candidate.folder == parent_folder)
@@ -328,8 +331,11 @@ fn update_downloaded_wowinterface_addon(
             ));
         }
 
-        let scanned = scan_addons_dir(&extracted.source_root, GameFlavor::Retail)
-            .map_err(|error| error.to_string())?;
+        let scanned = scan_addons_dir(
+            &extracted.source_root,
+            GameFlavor::from_addons_dir(addon_dir),
+        )
+        .map_err(|error| error.to_string())?;
         let parent_metadata = scanned
             .iter()
             .find(|candidate| candidate.folder == tracked.folder)

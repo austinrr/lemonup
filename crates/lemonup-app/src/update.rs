@@ -599,7 +599,7 @@ pub(crate) fn refresh_managed_update_state_for_selectors(
     selectors: &[String],
     dry_run: bool,
 ) -> lemonup_core::Result<UpdateRefreshSummary> {
-    let scanned = scan_addons_dir(addon_dir, GameFlavor::Retail)?;
+    let scanned = scan_addons_dir(addon_dir, GameFlavor::from_addons_dir(addon_dir))?;
     let scanned_by_folder = scanned
         .iter()
         .map(|addon| (addon.folder.as_str(), addon))

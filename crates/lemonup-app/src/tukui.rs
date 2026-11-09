@@ -261,7 +261,7 @@ fn install_downloaded_tukui_addon(
         extract_zip_archive(&zip_path, &extract_root)?;
 
         let layout = inspect_tukui_package_layout(&extract_root, addon)?;
-        let scanned = scan_addons_dir(&layout.source_root, GameFlavor::Retail)
+        let scanned = scan_addons_dir(&layout.source_root, GameFlavor::from_addons_dir(addon_dir))
             .map_err(|error| error.to_string())?;
         let parent_metadata = scanned
             .iter()
@@ -335,7 +335,7 @@ fn update_downloaded_tukui_addon(
             ));
         }
 
-        let scanned = scan_addons_dir(&layout.source_root, GameFlavor::Retail)
+        let scanned = scan_addons_dir(&layout.source_root, GameFlavor::from_addons_dir(addon_dir))
             .map_err(|error| error.to_string())?;
         let parent_metadata = scanned
             .iter()

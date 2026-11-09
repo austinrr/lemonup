@@ -399,6 +399,7 @@ fn flavor_suffixes(flavor: GameFlavor) -> &'static [&'static str] {
             "-Classic", "_Classic", "-Vanilla", "_Vanilla", "-Era", "_Era",
         ],
         GameFlavor::Cata => &["-Cata", "_Cata", "-Cataclysm", "_Cataclysm"],
+        GameFlavor::Forever => &["-Forever", "_Forever"],
     }
 }
 
@@ -535,6 +536,27 @@ mod tests {
 
         assert_eq!(selected.selected, "Alpha.toc");
         assert_eq!(selected.confidence, TocSelectionConfidence::Ambiguous);
+    }
+
+    #[test]
+    fn forever_reads_its_own_or_the_base_toc_never_mainline() {
+        let tocs = [
+            "OpenMap.toc".to_string(),
+            "OpenMap_Mainline.toc".to_string(),
+        ];
+        let selected = select_toc_file("OpenMap", &tocs, GameFlavor::Forever).expect("select toc");
+        assert_eq!(selected.selected, "OpenMap.toc");
+        assert_eq!(selected.confidence, TocSelectionConfidence::Fallback);
+
+        let with_own = [
+            tocs[0].clone(),
+            tocs[1].clone(),
+            "OpenMap_Forever.toc".to_string(),
+        ];
+        let selected =
+            select_toc_file("OpenMap", &with_own, GameFlavor::Forever).expect("select toc");
+        assert_eq!(selected.selected, "OpenMap_Forever.toc");
+        assert_eq!(selected.confidence, TocSelectionConfidence::Exact);
     }
 
     #[test]

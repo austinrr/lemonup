@@ -1,4 +1,4 @@
-use std::path::PathBuf;
+use std::path::{Path, PathBuf};
 
 use serde::{Deserialize, Serialize};
 use time::OffsetDateTime;
@@ -19,6 +19,32 @@ pub enum GameFlavor {
     Retail,
     Classic,
     Cata,
+    Forever,
+}
+
+impl GameFlavor {
+    /// The flavor an AddOns folder belongs to, from the client folder right above
+    /// `Interface/AddOns` (`_forever_/Interface/AddOns`). Anything else stays retail.
+    pub fn from_addons_dir(path: &Path) -> Self {
+        let parts = path
+            .components()
+            .map(|component| component.as_os_str().to_string_lossy().to_string())
+            .collect::<Vec<_>>();
+        let client_folder = match parts.as_slice() {
+            [.., client, interface, addons]
+                if interface.eq_ignore_ascii_case("Interface")
+                    && addons.eq_ignore_ascii_case("AddOns") =>
+            {
+                Some(client.as_str())
+            }
+            _ => None,
+        };
+        if client_folder.is_some_and(|client| client.eq_ignore_ascii_case("_forever_")) {
+            GameFlavor::Forever
+        } else {
+            GameFlavor::Retail
+        }
+    }
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
@@ -132,7 +158,45 @@ impl AddonRecord {
 
 #[cfg(test)]
 mod tests {
-    use super::{AddonRecord, OwnershipSource, SourceKind};
+    use std::path::Path;
+
+    use super::{AddonRecord, GameFlavor, OwnershipSource, SourceKind};
+
+    #[test]
+    fn flavor_comes_from_the_client_folder() {
+        assert_eq!(
+            GameFlavor::from_addons_dir(Path::new(
+                "/games/World of Warcraft/_forever_/Interface/AddOns"
+            )),
+            GameFlavor::Forever
+        );
+        assert_eq!(
+            GameFlavor::from_addons_dir(Path::new(
+                "/games/World of Warcraft/_FOREVER_/Interface/AddOns"
+            )),
+            GameFlavor::Forever
+        );
+        assert_eq!(
+            GameFlavor::from_addons_dir(Path::new(
+                "/games/World of Warcraft/_retail_/Interface/AddOns"
+            )),
+            GameFlavor::Retail
+        );
+        // only the client folder counts, not a "_forever_" further up the path
+        assert_eq!(
+            GameFlavor::from_addons_dir(Path::new(
+                "/mnt/_forever_/World of Warcraft/_retail_/Interface/AddOns"
+            )),
+            GameFlavor::Retail
+        );
+        // a trailing slash is still the same folder
+        assert_eq!(
+            GameFlavor::from_addons_dir(Path::new(
+                "/games/World of Warcraft/_forever_/Interface/AddOns/"
+            )),
+            GameFlavor::Forever
+        );
+    }
 
     #[test]
     fn managed_empty_owned_folders_remain_authoritative() {
