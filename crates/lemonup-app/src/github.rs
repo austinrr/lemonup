@@ -6,7 +6,10 @@ use std::time::{SystemTime, UNIX_EPOCH};
 use lemonup_core::{
     AddonRecord, GameFlavor, OwnedFolder, ScannedAddon, SourceKind, StateDatabase, scan_addons_dir,
 };
-use reqwest::{Client, StatusCode, Url};
+use std::sync::OnceLock;
+
+use reqwest::header::{AUTHORIZATION, HeaderMap, HeaderValue};
+use reqwest::{Client, Response, StatusCode, Url};
 use serde::Deserialize;
 use time::OffsetDateTime;
 use zip::ZipArchive;
@@ -200,10 +203,98 @@ pub(crate) async fn update_github_addon(
 }
 
 fn build_github_client() -> Result<Client, String> {
-    Client::builder()
-        .user_agent("LemonUp/2 (+https://github.com/archcorsair/lemonup)")
-        .build()
+    let mut builder =
+        Client::builder().user_agent("LemonUp/2 (+https://github.com/archcorsair/lemonup)");
+    // logged-in requests get 5000 an hour instead of 60; reqwest drops the header when a
+    // download redirects off github.com
+    if let Some(token) = github_token() {
+        let mut value = HeaderValue::from_str(&format!("Bearer {token}"))
+            .map_err(|_| "GitHub token contains invalid characters".to_string())?;
+        value.set_sensitive(true);
+        let mut headers = HeaderMap::new();
+        headers.insert(AUTHORIZATION, value);
+        builder = builder.default_headers(headers);
+    }
+    builder.build().map_err(|error| error.to_string())
+}
+
+/// A GitHub token from `GITHUB_TOKEN` or `GH_TOKEN`, else the GitHub CLI's login
+/// (`gh auth token`). Looked up once per run.
+fn github_token() -> Option<String> {
+    static TOKEN: OnceLock<Option<String>> = OnceLock::new();
+    TOKEN
+        .get_or_init(|| {
+            ["GITHUB_TOKEN", "GH_TOKEN"]
+                .iter()
+                .filter_map(|name| std::env::var(name).ok())
+                .map(|value| value.trim().to_string())
+                .find(|value| !value.is_empty())
+                .or_else(gh_cli_token)
+        })
+        .clone()
+}
+
+fn gh_cli_token() -> Option<String> {
+    let output = std::process::Command::new("gh")
+        .args(["auth", "token"])
+        .stdin(std::process::Stdio::null())
+        .stderr(std::process::Stdio::null())
+        .output()
+        .ok()?;
+    if !output.status.success() {
+        return None;
+    }
+    let token = String::from_utf8(output.stdout).ok()?.trim().to_string();
+    (!token.is_empty()).then_some(token)
+}
+
+/// Turns an error status into a message, spelling out GitHub's rate limit (a bare
+/// 403 or 429 otherwise).
+fn check_github_response(response: Response) -> Result<Response, String> {
+    let status = response.status();
+    if status.is_success() {
+        return Ok(response);
+    }
+    let header = |name: &str| {
+        response
+            .headers()
+            .get(name)
+            .and_then(|value| value.to_str().ok())
+            .map(ToOwned::to_owned)
+    };
+    let rate_limited = (status == StatusCode::FORBIDDEN || status == StatusCode::TOO_MANY_REQUESTS)
+        && header("x-ratelimit-remaining").as_deref() == Some("0");
+    if rate_limited {
+        let now = SystemTime::now()
+            .duration_since(UNIX_EPOCH)
+            .map(|elapsed| elapsed.as_secs())
+            .unwrap_or_default();
+        let reset_at = header("x-ratelimit-reset").and_then(|value| value.parse::<u64>().ok());
+        return Err(rate_limit_message(
+            reset_at,
+            now,
+            header("x-ratelimit-limit").as_deref(),
+        ));
+    }
+    response
+        .error_for_status()
         .map_err(|error| error.to_string())
+}
+
+fn rate_limit_message(reset_at: Option<u64>, now: u64, limit: Option<&str>) -> String {
+    let wait = match reset_at {
+        Some(reset_at) => {
+            let minutes = reset_at.saturating_sub(now).div_ceil(60).max(1);
+            format!("try again in {minutes} min")
+        }
+        None => "try again later".to_string(),
+    };
+    let fix = if limit == Some("60") {
+        "; set GITHUB_TOKEN or log in with `gh auth login` for a higher limit"
+    } else {
+        ""
+    };
+    format!("GitHub rate limit reached: {wait}{fix}")
 }
 
 async fn fetch_github_repo(
@@ -262,9 +353,7 @@ async fn fetch_github_latest_release(
         return Ok(None);
     }
 
-    let response = response
-        .error_for_status()
-        .map_err(|error| error.to_string())?;
+    let response = check_github_response(response)?;
     response
         .json::<GithubReleaseResponse>()
         .await
@@ -377,9 +466,7 @@ async fn fetch_github_repo_metadata(
         ));
     }
 
-    let response = response
-        .error_for_status()
-        .map_err(|error| error.to_string())?;
+    let response = check_github_response(response)?;
     let parsed = response
         .json::<GithubRepoResponse>()
         .await
@@ -415,9 +502,7 @@ async fn fetch_github_commit(
         ));
     }
 
-    let response = response
-        .error_for_status()
-        .map_err(|error| error.to_string())?;
+    let response = check_github_response(response)?;
     let parsed = response
         .json::<GithubCommitResponse>()
         .await
@@ -445,9 +530,8 @@ async fn download_github_package_bytes(
         .get(url)
         .send()
         .await
-        .map_err(|error| error.to_string())?
-        .error_for_status()
-        .map_err(|error| error.to_string())?
+        .map_err(|error| error.to_string())
+        .and_then(check_github_response)?
         .bytes()
         .await
         .map(|bytes| bytes.to_vec())
@@ -1324,6 +1408,23 @@ mod tests {
         assert_eq!(
             selected(&names, GameFlavor::Retail).as_deref(),
             Some("Addon-1.0.zip")
+        );
+    }
+
+    #[test]
+    fn rate_limit_message_says_when_and_how_to_raise_the_limit() {
+        assert_eq!(
+            super::rate_limit_message(Some(1_000 + 230), 1_000, Some("60")),
+            "GitHub rate limit reached: try again in 4 min; set GITHUB_TOKEN or log in with `gh auth login` for a higher limit"
+        );
+        // already logged in: nothing more to suggest
+        assert_eq!(
+            super::rate_limit_message(Some(1_000), 1_000, Some("5000")),
+            "GitHub rate limit reached: try again in 1 min"
+        );
+        assert_eq!(
+            super::rate_limit_message(None, 1_000, None),
+            "GitHub rate limit reached: try again later"
         );
     }
 
