@@ -152,6 +152,13 @@ impl App {
             ],
             HelpContext::InstallSearch => vec![
                 (
+                    " Installers ",
+                    vec![
+                        self.help_entry("←/→", "Switch between the GitHub and Wago pages"),
+                        self.help_entry("enter", "GitHub page: install the pasted repo URL"),
+                    ],
+                ),
+                (
                     " Query ",
                     vec![
                         self.help_entry("enter", "Search by name or install a Wago URL"),

@@ -1,6 +1,10 @@
 use super::*;
 impl App {
     pub(super) fn render_search_overlay(&self, frame: &mut Frame<'_>, area: Rect) {
+        if self.install_page == InstallPage::Github {
+            self.render_github_install_page(frame, area);
+            return;
+        }
         let content_area = area.inner(Margin {
             vertical: 1,
             horizontal: 1,
@@ -91,18 +95,21 @@ impl App {
     }
 
     pub(super) fn search_summary_lines(&self) -> Vec<Line<'static>> {
-        let mut lines = vec![Line::from(vec![
-            Span::styled("Use: ", Style::default().fg(self.ui_theme.muted)),
-            Span::styled(
-                "Search Wago by addon name",
-                Style::default().fg(self.ui_theme.panel_title),
-            ),
-            Span::styled("  ·  ", Style::default().fg(self.ui_theme.muted)),
-            Span::styled(
-                "Paste a Wago URL to install directly",
-                Style::default().fg(self.ui_theme.panel_title),
-            ),
-        ])];
+        let mut lines = vec![
+            self.install_page_tabs_line(),
+            Line::from(vec![
+                Span::styled("Use: ", Style::default().fg(self.ui_theme.muted)),
+                Span::styled(
+                    "Search Wago by addon name",
+                    Style::default().fg(self.ui_theme.panel_title),
+                ),
+                Span::styled("  ·  ", Style::default().fg(self.ui_theme.muted)),
+                Span::styled(
+                    "Paste a Wago URL to install directly",
+                    Style::default().fg(self.ui_theme.panel_title),
+                ),
+            ]),
+        ];
 
         let status_line = if self.wago_api_key.is_none() {
             Line::from(vec![
@@ -322,6 +329,10 @@ impl App {
             ]
         };
 
+        self.action_chips_line(chips)
+    }
+
+    fn action_chips_line(&self, chips: Vec<SearchActionChip>) -> Line<'static> {
         let mut spans = Vec::new();
         for (index, chip) in chips.into_iter().enumerate() {
             if index > 0 {
@@ -356,6 +367,194 @@ impl App {
         }
 
         Line::from(spans)
+    }
+
+    /// `‹ GitHub  [ Wago ] ›`: which installer page is showing, and that the arrows move.
+    pub(super) fn install_page_tabs_line(&self) -> Line<'static> {
+        let mut spans = vec![Span::styled("‹ ", Style::default().fg(self.ui_theme.muted))];
+        for (index, page) in InstallPage::ALL.iter().enumerate() {
+            if index > 0 {
+                spans.push(Span::raw("  "));
+            }
+            if *page == self.install_page {
+                spans.push(Span::styled(
+                    format!("[ {} ]", page.label()),
+                    Style::default()
+                        .fg(self.ui_theme.highlight)
+                        .add_modifier(Modifier::BOLD),
+                ));
+            } else {
+                spans.push(Span::styled(
+                    page.label().to_string(),
+                    Style::default().fg(self.ui_theme.muted),
+                ));
+            }
+        }
+        spans.push(Span::styled(" ›", Style::default().fg(self.ui_theme.muted)));
+        spans.push(Span::styled(
+            "   ←/→ switch installer",
+            Style::default().fg(self.ui_theme.muted),
+        ));
+        Line::from(spans)
+    }
+
+    pub(super) fn render_github_install_page(&self, frame: &mut Frame<'_>, area: Rect) {
+        let content_area = area.inner(Margin {
+            vertical: 1,
+            horizontal: 1,
+        });
+        let summary_lines = self.github_summary_lines();
+        let sections = Layout::default()
+            .direction(Direction::Vertical)
+            .constraints([
+                Constraint::Length(summary_lines.len() as u16),
+                Constraint::Length(3),
+                Constraint::Length(1),
+                Constraint::Min(4),
+                Constraint::Length(1),
+                Constraint::Length(1),
+            ])
+            .split(content_area);
+
+        frame.render_widget(
+            Paragraph::new(summary_lines).wrap(Wrap { trim: false }),
+            sections[0],
+        );
+        self.render_github_input(frame, sections[1]);
+        frame.render_widget(
+            Paragraph::new(vec![
+                Line::from(Span::styled(
+                    "Installs the latest release's zip for your game when the repo publishes one,",
+                    Style::default().fg(self.ui_theme.muted),
+                )),
+                Line::from(Span::styled(
+                    "otherwise the repo's source. It's tracked for updates like any other addon.",
+                    Style::default().fg(self.ui_theme.muted),
+                )),
+            ])
+            .wrap(Wrap { trim: false }),
+            sections[3],
+        );
+        frame.render_widget(
+            Paragraph::new(self.github_action_line()).alignment(Alignment::Center),
+            sections[5],
+        );
+    }
+
+    fn github_summary_lines(&self) -> Vec<Line<'static>> {
+        let input = self.github_pane.input.trim();
+        let (status, warn) = if self.wago_install_in_progress {
+            ("Installing…".to_string(), true)
+        } else if let Some(result) = &self.github_pane.last_result {
+            match result {
+                GithubInstallResult::Installed(message) => (message.clone(), false),
+                GithubInstallResult::Failed(error) => (format!("Install failed: {error}"), true),
+            }
+        } else if input.is_empty() {
+            (
+                "Paste a repo URL like https://github.com/owner/repo".to_string(),
+                false,
+            )
+        } else if super::github_install_target(input).is_some() {
+            ("Press Enter to install".to_string(), false)
+        } else {
+            ("Not a GitHub repo URL yet".to_string(), true)
+        };
+        let status_style = if warn {
+            Style::default()
+                .fg(self.ui_theme.warning)
+                .add_modifier(Modifier::BOLD)
+        } else {
+            Style::default().fg(self.ui_theme.panel_title)
+        };
+        vec![
+            self.install_page_tabs_line(),
+            Line::from(vec![
+                Span::styled("Use: ", Style::default().fg(self.ui_theme.muted)),
+                Span::styled(
+                    "Paste a GitHub repo URL to install it",
+                    Style::default().fg(self.ui_theme.panel_title),
+                ),
+            ]),
+            Line::from(vec![
+                Span::styled("Status: ", Style::default().fg(self.ui_theme.muted)),
+                Span::styled(status, status_style),
+            ]),
+        ]
+    }
+
+    fn render_github_input(&self, frame: &mut Frame<'_>, area: Rect) {
+        let active = self.github_pane.is_editing || self.wago_install_in_progress;
+        let block = Block::default()
+            .borders(Borders::ALL)
+            .border_style(if active {
+                Style::default().fg(self.ui_theme.highlight)
+            } else {
+                Style::default().fg(self.ui_theme.border)
+            })
+            .title(" GitHub repo URL ");
+
+        let mut spans = Vec::new();
+        if self.github_pane.input.is_empty() {
+            if self.github_pane.is_editing {
+                spans.push(Span::styled(
+                    "▌",
+                    Style::default().fg(self.ui_theme.brand_gold),
+                ));
+            } else {
+                spans.push(Span::styled(
+                    "https://github.com/<owner>/<repo>",
+                    Style::default().fg(self.ui_theme.muted),
+                ));
+            }
+        } else {
+            spans.push(Span::styled(
+                self.github_pane.input.clone(),
+                Style::default()
+                    .fg(self.ui_theme.highlight)
+                    .add_modifier(Modifier::BOLD),
+            ));
+            if self.github_pane.is_editing {
+                spans.push(Span::styled(
+                    " ▌",
+                    Style::default().fg(self.ui_theme.brand_gold),
+                ));
+            }
+        }
+
+        frame.render_widget(
+            Paragraph::new(Line::from(spans))
+                .block(block)
+                .wrap(Wrap { trim: false }),
+            area,
+        );
+    }
+
+    fn github_action_line(&self) -> Line<'static> {
+        let ready = !self.wago_install_in_progress
+            && super::github_install_target(&self.github_pane.input).is_some();
+        let (edit_key, edit_label) = if self.github_pane.is_editing {
+            ("esc", "stop editing")
+        } else {
+            ("/", "edit input")
+        };
+        self.action_chips_line(vec![
+            SearchActionChip {
+                key: "enter",
+                label: "install",
+                enabled: ready,
+            },
+            SearchActionChip {
+                key: edit_key,
+                label: edit_label,
+                enabled: true,
+            },
+            SearchActionChip {
+                key: "←/→",
+                label: "switch",
+                enabled: true,
+            },
+        ])
     }
 
     pub(super) fn render_search_compose_first_body(&self, frame: &mut Frame<'_>, area: Rect) {

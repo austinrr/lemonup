@@ -30,6 +30,7 @@ use crate::backup::{
 };
 use crate::drift::{DriftReport, compute_drift_report};
 use crate::event::{EventHandler, TerminalEvent};
+use crate::github::{GithubInstallSummary, install_github_addon, parse_github_target};
 use crate::onboarding::{
     FoundAction, OnboardingPhase, OnboardingSettingsField, OnboardingState, OnboardingStep,
     OnboardingTaskEvent,
@@ -414,6 +415,13 @@ enum AppMessage {
     SearchStopEditing,
     SearchInputChar(char),
     SearchBackspace,
+    InstallPagePrevious,
+    InstallPageNext,
+    GithubBeginEditing,
+    GithubStopEditing,
+    GithubInputChar(char),
+    GithubBackspace,
+    GithubSubmit,
     SearchSubmit,
     SearchResultNext,
     SearchResultPrevious,
@@ -477,6 +485,7 @@ enum AppTaskEvent {
     TransferImportFinished(std::result::Result<TransferImportOutcome, String>),
     WagoSearchFinished(std::result::Result<WagoSearchOutcome, String>),
     WagoInstallFinished(std::result::Result<WagoInstallTaskOutcome, String>),
+    GithubInstallFinished(std::result::Result<GithubInstallOutcome, String>),
 }
 
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -528,6 +537,12 @@ struct WagoSearchOutcome {
 #[derive(Debug, Clone, PartialEq, Eq)]
 struct WagoInstallOutcome {
     summary: WagoInstallSummary,
+    sync: AddonScanOutcome,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub(crate) struct GithubInstallOutcome {
+    summary: GithubInstallSummary,
     sync: AddonScanOutcome,
 }
 
@@ -1671,6 +1686,102 @@ enum SearchPresentationMode {
     TwoState,
 }
 
+/// The install screen's pages, left to right. The screen opens on Wago.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
+pub enum InstallPage {
+    Github,
+    #[default]
+    Wago,
+}
+
+impl InstallPage {
+    const ALL: [InstallPage; 2] = [InstallPage::Github, InstallPage::Wago];
+
+    fn label(self) -> &'static str {
+        match self {
+            InstallPage::Github => "GitHub",
+            InstallPage::Wago => "Wago",
+        }
+    }
+
+    fn index(self) -> usize {
+        Self::ALL
+            .iter()
+            .position(|page| *page == self)
+            .unwrap_or_default()
+    }
+
+    fn previous(self) -> Self {
+        Self::ALL[self.index().saturating_sub(1)]
+    }
+
+    fn next(self) -> Self {
+        Self::ALL[(self.index() + 1).min(Self::ALL.len() - 1)]
+    }
+}
+
+#[derive(Debug, Clone, Default, PartialEq, Eq)]
+pub struct GithubInstallPaneState {
+    input: String,
+    is_editing: bool,
+    /// The last install's outcome, shown until the input changes.
+    last_result: Option<GithubInstallResult>,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+enum GithubInstallResult {
+    Installed(String),
+    Failed(String),
+}
+
+impl GithubInstallPaneState {
+    fn begin_editing(&self) -> Self {
+        Self {
+            is_editing: true,
+            ..self.clone()
+        }
+    }
+
+    fn stop_editing(&self) -> Self {
+        Self {
+            is_editing: false,
+            ..self.clone()
+        }
+    }
+
+    fn insert_char(&self, character: char) -> Self {
+        let mut next = self.clone();
+        next.input.push(character);
+        next.last_result = None;
+        next
+    }
+
+    fn backspace(&self) -> Self {
+        let mut next = self.clone();
+        next.input.pop();
+        next.last_result = None;
+        next
+    }
+
+    /// Ready for the next URL, saying what was installed.
+    fn installed(&self, message: String) -> Self {
+        Self {
+            input: String::new(),
+            is_editing: true,
+            last_result: Some(GithubInstallResult::Installed(message)),
+        }
+    }
+
+    /// Keeps the URL so it can be fixed and retried.
+    fn failed(&self, error: String) -> Self {
+        Self {
+            is_editing: true,
+            last_result: Some(GithubInstallResult::Failed(error)),
+            ..self.clone()
+        }
+    }
+}
+
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct SearchPaneState {
     query: String,
@@ -1972,6 +2083,8 @@ pub struct App {
     inspect_overlay: InspectOverlayState,
     install_pane: InstallPaneState,
     search_pane: SearchPaneState,
+    install_page: InstallPage,
+    github_pane: GithubInstallPaneState,
     pending_wago_install_confirmation: Option<WagoInstallConfirmation>,
     wago_install_in_progress: bool,
     auto_check_in_progress: bool,
@@ -2081,6 +2194,8 @@ impl App {
             inspect_overlay: InspectOverlayState::default(),
             install_pane: InstallPaneState::default(),
             search_pane: SearchPaneState::default(),
+            install_page: InstallPage::default(),
+            github_pane: GithubInstallPaneState::default(),
             pending_wago_install_confirmation: None,
             wago_install_in_progress: false,
             auto_check_in_progress: false,
@@ -2633,6 +2748,16 @@ impl App {
             return None;
         }
 
+        // the arrows page between installers; typed text never needs them
+        match key.code {
+            KeyCode::Left => return Some(vec![AppMessage::InstallPagePrevious]),
+            KeyCode::Right => return Some(vec![AppMessage::InstallPageNext]),
+            _ => {}
+        }
+        if self.install_page == InstallPage::Github {
+            return self.github_page_messages_for_key(key);
+        }
+
         if self.wago_api_key.is_none() && matches!(key.code, KeyCode::Char(',')) {
             return Some(vec![AppMessage::SetDetailMode(DetailMode::Config)]);
         }
@@ -2661,6 +2786,73 @@ impl App {
             KeyCode::Char('/') => Some(vec![AppMessage::SearchBeginEditing]),
             _ => None,
         }
+    }
+
+    fn install_page_actions(&self, page: InstallPage) -> Vec<AppAction> {
+        if page == self.install_page {
+            return Vec::new();
+        }
+        match page {
+            InstallPage::Github => vec![
+                AppAction::SetInstallPage(page),
+                // ready to paste straight away, as the Wago page is on open
+                AppAction::SetGithubPaneState(self.github_pane.begin_editing()),
+                AppAction::SetStatus(self.dashboard_status_for(
+                    DetailMode::Search,
+                    "install from GitHub | paste a repo URL and press enter",
+                )),
+            ],
+            InstallPage::Wago => vec![
+                AppAction::SetInstallPage(page),
+                AppAction::SetStatus(self.dashboard_status_for(
+                    DetailMode::Search,
+                    "install from Wago | type a name or Wago URL and press enter",
+                )),
+            ],
+        }
+    }
+
+    fn github_page_messages_for_key(&self, key: KeyEvent) -> Option<Vec<AppMessage>> {
+        if self.github_pane.is_editing {
+            return Some(match key.code {
+                KeyCode::Enter => vec![AppMessage::GithubSubmit],
+                KeyCode::Esc => vec![AppMessage::GithubStopEditing],
+                KeyCode::Backspace => vec![AppMessage::GithubBackspace],
+                KeyCode::Char(character) => vec![AppMessage::GithubInputChar(character)],
+                _ => vec![],
+            });
+        }
+        match key.code {
+            KeyCode::Enter => Some(vec![AppMessage::GithubSubmit]),
+            KeyCode::Char('/') | KeyCode::Char('e') => Some(vec![AppMessage::GithubBeginEditing]),
+            _ => None,
+        }
+    }
+
+    /// Installing a GitHub repo needs no Wago key: only the addon folder, and no
+    /// pending delete in the way.
+    fn github_install_actions(&self, mode: DetailMode, target: String) -> Vec<AppAction> {
+        if self.dashboard.pending_delete_folders().is_some() {
+            return vec![AppAction::SetStatus(self.dashboard_status_for(
+                mode,
+                "confirm or cancel the pending delete before installing addons",
+            ))];
+        }
+        let Some(addon_dir) = self.effective_addon_dir.clone() else {
+            return vec![AppAction::SetStatus(
+                self.dashboard_status_for(mode, "addon directory is not configured"),
+            )];
+        };
+        vec![
+            AppAction::SetWagoInstallInProgress(true),
+            AppAction::StartGithubInstall {
+                addon_dir,
+                target: target.clone(),
+            },
+            AppAction::SetStatus(
+                self.dashboard_status_for(mode, &format!("installing from GitHub: {target}")),
+            ),
+        ]
     }
 
     fn install_messages_for_key(&self, key: KeyEvent) -> Option<Vec<AppMessage>> {
@@ -3368,7 +3560,7 @@ impl App {
                 if self.wago_install_in_progress {
                     vec![AppAction::SetStatus(self.dashboard_status_for(
                         DetailMode::Install,
-                        "Wago install already running",
+                        "an install is already running",
                     ))]
                 } else if self.dashboard.pending_delete_folders().is_some() {
                     vec![AppAction::SetStatus(self.dashboard_status_for(
@@ -3418,6 +3610,7 @@ impl App {
                 )),
             ],
             AppMessage::OpenSearch(mode) => vec![
+                AppAction::SetInstallPage(InstallPage::Wago),
                 AppAction::SetSearchPaneState(self.search_pane.open_with_mode(mode)),
                 AppAction::SetDetailMode(DetailMode::Search),
                 AppAction::SetStatus(self.dashboard_status_for(
@@ -3437,6 +3630,51 @@ impl App {
             AppMessage::SearchBackspace => {
                 vec![AppAction::SetSearchPaneState(self.search_pane.backspace())]
             }
+            AppMessage::InstallPagePrevious => {
+                self.install_page_actions(self.install_page.previous())
+            }
+            AppMessage::InstallPageNext => self.install_page_actions(self.install_page.next()),
+            AppMessage::GithubBeginEditing => {
+                vec![AppAction::SetGithubPaneState(
+                    self.github_pane.begin_editing(),
+                )]
+            }
+            AppMessage::GithubStopEditing => {
+                vec![AppAction::SetGithubPaneState(
+                    self.github_pane.stop_editing(),
+                )]
+            }
+            AppMessage::GithubInputChar(character) => vec![AppAction::SetGithubPaneState(
+                self.github_pane.insert_char(character),
+            )],
+            AppMessage::GithubBackspace => {
+                vec![AppAction::SetGithubPaneState(self.github_pane.backspace())]
+            }
+            AppMessage::GithubSubmit => {
+                if self.wago_install_in_progress {
+                    vec![AppAction::SetStatus(self.dashboard_status_for(
+                        DetailMode::Search,
+                        "an install is already running",
+                    ))]
+                } else if self.github_pane.input.trim().is_empty() {
+                    vec![AppAction::SetStatus(self.dashboard_status_for(
+                        DetailMode::Search,
+                        "paste a GitHub repo URL before installing",
+                    ))]
+                } else if let Some(target) = github_install_target(&self.github_pane.input) {
+                    let mut actions = self.github_install_actions(DetailMode::Search, target);
+                    actions.insert(
+                        0,
+                        AppAction::SetGithubPaneState(self.github_pane.stop_editing()),
+                    );
+                    actions
+                } else {
+                    vec![AppAction::SetStatus(self.dashboard_status_for(
+                        DetailMode::Search,
+                        "not a GitHub repo URL: expected https://github.com/<owner>/<repo>",
+                    ))]
+                }
+            }
             AppMessage::SearchSubmit => {
                 if self.search_pane.in_progress {
                     vec![AppAction::SetStatus(self.dashboard_status_for(
@@ -3446,7 +3684,7 @@ impl App {
                 } else if self.wago_install_in_progress {
                     vec![AppAction::SetStatus(self.dashboard_status_for(
                         DetailMode::Search,
-                        "Wago install already running",
+                        "an install is already running",
                     ))]
                 } else if self.wago_api_key.is_none() {
                     vec![AppAction::SetStatus(self.dashboard_status_for(
@@ -3546,7 +3784,7 @@ impl App {
                 if self.wago_install_in_progress {
                     vec![AppAction::SetStatus(self.dashboard_status_for(
                         DetailMode::Search,
-                        "Wago install already running",
+                        "an install is already running",
                     ))]
                 } else if self.wago_api_key.is_none() {
                     vec![AppAction::SetStatus(self.dashboard_status_for(
@@ -3589,7 +3827,7 @@ impl App {
                     if self.wago_install_in_progress {
                         vec![AppAction::SetStatus(self.dashboard_status_for(
                             self.dashboard.detail_mode,
-                            "Wago install already running",
+                            "an install is already running",
                         ))]
                     } else if self.wago_api_key.is_none() {
                         vec![AppAction::SetStatus(self.dashboard_status_for(
@@ -4479,6 +4717,40 @@ impl App {
                         )),
                     ]
                 }
+                AppTaskEvent::GithubInstallFinished(Ok(outcome)) => {
+                    let version = outcome
+                        .summary
+                        .version
+                        .as_deref()
+                        .map(|version| format!(" {version}"))
+                        .unwrap_or_default();
+                    let installed = format!("Installed {}{version}", outcome.summary.parent_folder);
+                    vec![
+                        AppAction::ReplaceDashboardAddons(outcome.sync.addons),
+                        AppAction::SetDashboardDriftReport(Some(outcome.sync.drift_report)),
+                        AppAction::CompleteAddonScan {
+                            path: outcome.sync.path,
+                            summary: outcome.sync.summary,
+                        },
+                        AppAction::SetWagoInstallInProgress(false),
+                        AppAction::SetGithubPaneState(self.github_pane.installed(installed)),
+                        AppAction::SetStatus(self.dashboard_status_for(
+                            self.dashboard.detail_mode,
+                            &format!(
+                                "installed GitHub addon '{}'{version} into {} | sync complete",
+                                outcome.summary.repo_name, outcome.summary.parent_folder
+                            ),
+                        )),
+                    ]
+                }
+                AppTaskEvent::GithubInstallFinished(Err(error)) => vec![
+                    AppAction::SetWagoInstallInProgress(false),
+                    AppAction::SetGithubPaneState(self.github_pane.failed(error.clone())),
+                    AppAction::SetStatus(self.dashboard_status_for(
+                        self.dashboard.detail_mode,
+                        &format!("GitHub install failed: {error}"),
+                    )),
+                ],
             },
         }
     }
@@ -4583,6 +4855,12 @@ impl App {
             }
             AppAction::SetSearchPaneState(state) => {
                 self.search_pane = state;
+            }
+            AppAction::SetInstallPage(page) => {
+                self.install_page = page;
+            }
+            AppAction::SetGithubPaneState(state) => {
+                self.github_pane = state;
             }
             AppAction::SetConfigPaneState(state) => {
                 self.config_pane = state;
@@ -5017,6 +5295,26 @@ impl App {
                     .await
                     .unwrap_or_else(|join_error| Err(join_error.to_string()));
                     let _ = sender.send(AppTaskEvent::WagoInstallFinished(result));
+                });
+            }
+            AppAction::StartGithubInstall { addon_dir, target } => {
+                let sender = self.task_events_tx.clone();
+                let state_db_file = self.state_db_file.clone();
+                tokio::spawn(async move {
+                    let result = tokio::task::spawn_blocking(move || {
+                        let runtime = tokio::runtime::Builder::new_current_thread()
+                            .enable_all()
+                            .build()
+                            .map_err(|error| error.to_string())?;
+                        runtime.block_on(run_github_install_task(
+                            &state_db_file,
+                            &addon_dir,
+                            &target,
+                        ))
+                    })
+                    .await
+                    .unwrap_or_else(|join_error| Err(join_error.to_string()));
+                    let _ = sender.send(AppTaskEvent::GithubInstallFinished(result));
                 });
             }
             AppAction::ReplaceDashboardAddons(addons) => self.dashboard.replace_addons(addons),
@@ -6729,6 +7027,26 @@ async fn run_wago_install_task(
     }))
 }
 
+async fn run_github_install_task(
+    state_db_file: &Path,
+    addon_dir: &Path,
+    target: &str,
+) -> std::result::Result<GithubInstallOutcome, String> {
+    let mut database = StateDatabase::open(state_db_file).map_err(|error| error.to_string())?;
+    let summary = install_github_addon(&mut database, addon_dir, target, false).await?;
+    let sync = sync_dashboard_state(state_db_file, addon_dir)?;
+    Ok(GithubInstallOutcome { summary, sync })
+}
+
+/// A GitHub repo URL typed into the install or search box, canonicalised.
+fn github_install_target(input: &str) -> Option<String> {
+    let trimmed = input.trim();
+    if !(trimmed.starts_with("https://") || trimmed.starts_with("http://")) {
+        return None;
+    }
+    parse_github_target(trimmed).ok()
+}
+
 async fn run_transfer_import_task(
     state_db_file: &Path,
     addon_dir: &Path,
@@ -7360,6 +7678,10 @@ mod tests {
     use std::fs;
     use std::path::PathBuf;
 
+    use super::{
+        GithubInstallOutcome, GithubInstallPaneState, GithubInstallResult, GithubInstallSummary,
+        InstallPage, github_install_target,
+    };
     use crossterm::event::{
         KeyCode, KeyEvent, KeyEventKind, KeyEventState, KeyModifiers, MouseButton, MouseEvent,
         MouseEventKind,
@@ -7456,6 +7778,8 @@ mod tests {
             dashboard: DashboardState::from_addons(vec![first, second, third]),
             install_pane: InstallPaneState::default(),
             search_pane: SearchPaneState::default(),
+            install_page: InstallPage::default(),
+            github_pane: GithubInstallPaneState::default(),
             pending_wago_install_confirmation: None,
             wago_install_in_progress: false,
             auto_check_in_progress: false,
@@ -8838,6 +9162,256 @@ mod tests {
         ));
 
         assert!(matches!(actions[0], AppAction::SetSearchPaneState(_)));
+    }
+
+    #[test]
+    fn github_install_target_takes_only_github_repo_urls() {
+        assert_eq!(
+            github_install_target(" https://github.com/openmap-world/openmap.git ").as_deref(),
+            Some("https://github.com/openmap-world/openmap")
+        );
+        assert_eq!(github_install_target("openmap"), None);
+        assert_eq!(
+            github_install_target("https://addons.wago.io/addons/details"),
+            None
+        );
+        assert_eq!(
+            github_install_target("https://github.com/openmap-world"),
+            None
+        );
+    }
+
+    #[test]
+    fn search_submit_without_wago_key_still_blocks_name_search() {
+        let mut app = app_for_tests(ShellMode::Dashboard);
+        app.wago_api_key = None;
+        app.dashboard.detail_mode = DetailMode::Search;
+        app.search_pane.query = "details".to_string();
+
+        let actions = app.update(AppMessage::SearchSubmit);
+
+        assert_eq!(
+            actions,
+            vec![AppAction::SetStatus(app.dashboard_status_for(
+                DetailMode::Search,
+                "Wago search unavailable: no API key configured",
+            ))]
+        );
+    }
+
+    fn press(app: &mut App, code: KeyCode) {
+        for message in app.messages_for_key(KeyEvent::from(code)) {
+            for action in app.update(message) {
+                app.apply(action);
+            }
+        }
+    }
+
+    #[test]
+    fn install_pages_switch_with_arrows_and_stop_at_the_ends() {
+        let mut app = app_for_tests(ShellMode::Dashboard);
+        app.update(AppMessage::OpenSearch(SearchPresentationMode::ComposeFirst))
+            .into_iter()
+            .for_each(|action| app.apply(action));
+        assert_eq!(app.install_page, InstallPage::Wago);
+
+        press(&mut app, KeyCode::Right);
+        assert_eq!(app.install_page, InstallPage::Wago);
+
+        press(&mut app, KeyCode::Left);
+        assert_eq!(app.install_page, InstallPage::Github);
+        assert!(
+            app.github_pane.is_editing,
+            "GitHub page is ready to paste into"
+        );
+
+        press(&mut app, KeyCode::Left);
+        assert_eq!(app.install_page, InstallPage::Github);
+
+        press(&mut app, KeyCode::Right);
+        assert_eq!(app.install_page, InstallPage::Wago);
+    }
+
+    #[test]
+    fn reopening_the_install_screen_lands_on_wago() {
+        let mut app = app_for_tests(ShellMode::Dashboard);
+        app.dashboard.detail_mode = DetailMode::Search;
+        app.install_page = InstallPage::Github;
+
+        app.update(AppMessage::OpenSearch(SearchPresentationMode::ComposeFirst))
+            .into_iter()
+            .for_each(|action| app.apply(action));
+
+        assert_eq!(app.install_page, InstallPage::Wago);
+    }
+
+    #[test]
+    fn github_page_takes_typed_text_and_keeps_arrows_for_paging() {
+        let mut app = app_for_tests(ShellMode::Dashboard);
+        app.dashboard.detail_mode = DetailMode::Search;
+        app.install_page = InstallPage::Github;
+        app.github_pane = GithubInstallPaneState::default().begin_editing();
+
+        assert_eq!(
+            app.messages_for_key(KeyEvent::from(KeyCode::Char('q'))),
+            vec![AppMessage::GithubInputChar('q')]
+        );
+        assert_eq!(
+            app.messages_for_key(KeyEvent::from(KeyCode::Right)),
+            vec![AppMessage::InstallPageNext]
+        );
+        assert_eq!(
+            app.messages_for_key(KeyEvent::from(KeyCode::Enter)),
+            vec![AppMessage::GithubSubmit]
+        );
+    }
+
+    #[test]
+    fn github_page_submit_installs_without_a_wago_key() {
+        let mut app = app_for_tests(ShellMode::Dashboard);
+        app.wago_api_key = None;
+        app.dashboard.detail_mode = DetailMode::Search;
+        app.install_page = InstallPage::Github;
+        let addon_dir = PathBuf::from("/games/World of Warcraft/_forever_/Interface/AddOns");
+        app.effective_addon_dir = Some(addon_dir.clone());
+        app.github_pane = GithubInstallPaneState {
+            input: "https://github.com/openmap-world/openmap".to_string(),
+            is_editing: true,
+            last_result: None,
+        };
+
+        let actions = app.update(AppMessage::GithubSubmit);
+
+        assert_eq!(
+            actions,
+            vec![
+                AppAction::SetGithubPaneState(app.github_pane.stop_editing()),
+                AppAction::SetWagoInstallInProgress(true),
+                AppAction::StartGithubInstall {
+                    addon_dir,
+                    target: "https://github.com/openmap-world/openmap".to_string(),
+                },
+                AppAction::SetStatus(app.dashboard_status_for(
+                    DetailMode::Search,
+                    "installing from GitHub: https://github.com/openmap-world/openmap",
+                )),
+            ]
+        );
+    }
+
+    #[test]
+    fn github_page_submit_rejects_input_that_is_not_a_repo_url() {
+        let mut app = app_for_tests(ShellMode::Dashboard);
+        app.dashboard.detail_mode = DetailMode::Search;
+        app.install_page = InstallPage::Github;
+        app.github_pane.input = "openmap".to_string();
+
+        assert_eq!(
+            app.update(AppMessage::GithubSubmit),
+            vec![AppAction::SetStatus(app.dashboard_status_for(
+                DetailMode::Search,
+                "not a GitHub repo URL: expected https://github.com/<owner>/<repo>",
+            ))]
+        );
+
+        app.github_pane.input = "  ".to_string();
+        assert_eq!(
+            app.update(AppMessage::GithubSubmit),
+            vec![AppAction::SetStatus(app.dashboard_status_for(
+                DetailMode::Search,
+                "paste a GitHub repo URL before installing",
+            ))]
+        );
+    }
+
+    #[test]
+    fn wago_page_does_not_install_github_urls() {
+        let mut app = app_for_tests(ShellMode::Dashboard);
+        app.wago_api_key = None;
+        app.dashboard.detail_mode = DetailMode::Search;
+        app.search_pane.query = "https://github.com/openmap-world/openmap".to_string();
+
+        assert_eq!(
+            app.update(AppMessage::SearchSubmit),
+            vec![AppAction::SetStatus(app.dashboard_status_for(
+                DetailMode::Search,
+                "Wago search unavailable: no API key configured",
+            ))]
+        );
+    }
+
+    #[test]
+    fn github_install_finished_refreshes_dashboard_and_reports_version() {
+        let mut app = app_for_tests(ShellMode::Dashboard);
+        app.dashboard.detail_mode = DetailMode::Search;
+
+        let actions = app.update(AppMessage::BackgroundTask(
+            AppTaskEvent::GithubInstallFinished(Ok(GithubInstallOutcome {
+                summary: GithubInstallSummary {
+                    repo_url: "https://github.com/openmap-world/openmap".to_string(),
+                    repo_name: "openmap".to_string(),
+                    parent_folder: "OpenMap".to_string(),
+                    installed_folders: vec!["OpenMap".to_string()],
+                    version: Some("v0.8.2".to_string()),
+                    git_commit: "cea294cd7be86bc0bbedc078cdb48aa4b683bfef".to_string(),
+                    dry_run: false,
+                },
+                sync: AddonScanOutcome {
+                    path: PathBuf::from("/games/World of Warcraft/_forever_/Interface/AddOns"),
+                    summary: ScanSummary {
+                        scanned_addons: 1,
+                        upserted_addons: 1,
+                        removed_addons: 0,
+                    },
+                    addons: Vec::new(),
+                    drift_report: DriftReport::empty(),
+                },
+            })),
+        ));
+
+        assert!(matches!(actions[0], AppAction::ReplaceDashboardAddons(_)));
+        assert!(actions.contains(&AppAction::SetWagoInstallInProgress(false)));
+        assert!(
+            actions.contains(&AppAction::SetGithubPaneState(GithubInstallPaneState {
+                input: String::new(),
+                is_editing: true,
+                last_result: Some(GithubInstallResult::Installed(
+                    "Installed OpenMap v0.8.2".to_string()
+                )),
+            }))
+        );
+        assert_eq!(
+            actions.last(),
+            Some(&AppAction::SetStatus(app.dashboard_status_for(
+                DetailMode::Search,
+                "installed GitHub addon 'openmap' v0.8.2 into OpenMap | sync complete",
+            )))
+        );
+    }
+
+    #[test]
+    fn github_install_failure_clears_progress_and_reports_error() {
+        let mut app = app_for_tests(ShellMode::Dashboard);
+        app.dashboard.detail_mode = DetailMode::Search;
+
+        let actions = app.update(AppMessage::BackgroundTask(
+            AppTaskEvent::GithubInstallFinished(Err("folder 'OpenMap' already exists".to_string())),
+        ));
+
+        assert_eq!(
+            actions,
+            vec![
+                AppAction::SetWagoInstallInProgress(false),
+                AppAction::SetGithubPaneState(
+                    app.github_pane
+                        .failed("folder 'OpenMap' already exists".to_string())
+                ),
+                AppAction::SetStatus(app.dashboard_status_for(
+                    DetailMode::Search,
+                    "GitHub install failed: folder 'OpenMap' already exists",
+                )),
+            ]
+        );
     }
 
     #[test]

@@ -4,9 +4,9 @@ use lemonup_core::{AddonRecord, AppConfig, ScanSummary};
 
 use crate::app::{
     BackupPaneState, ConfigPaneState, DashboardJobUiState, DashboardSortColumn,
-    DashboardUndoDeleteState, DashboardUpdateRunSummary, DetailMode, FooterKeyPulse, HelpContext,
-    InspectOverlayState, InstallPaneState, PendingWagoInstallRequest, SearchPaneState,
-    WagoInstallConfirmation,
+    DashboardUndoDeleteState, DashboardUpdateRunSummary, DetailMode, FooterKeyPulse,
+    GithubInstallPaneState, HelpContext, InspectOverlayState, InstallPage, InstallPaneState,
+    PendingWagoInstallRequest, SearchPaneState, WagoInstallConfirmation,
 };
 use crate::drift::DriftReport;
 use crate::onboarding::OnboardingState;
@@ -34,6 +34,8 @@ pub enum AppAction {
     SetSelectedDashboardParents(Vec<String>),
     SetInstallPaneState(InstallPaneState),
     SetSearchPaneState(SearchPaneState),
+    SetInstallPage(InstallPage),
+    SetGithubPaneState(GithubInstallPaneState),
     SetConfigPaneState(ConfigPaneState),
     SetPersistedConfig(AppConfig),
     SetBackupPaneState(BackupPaneState),
@@ -100,6 +102,10 @@ pub enum AppAction {
         api_key: String,
         request: PendingWagoInstallRequest,
         allow_replace: bool,
+    },
+    StartGithubInstall {
+        addon_dir: PathBuf,
+        target: String,
     },
     ReplaceDashboardAddons(Vec<AddonRecord>),
     CompleteAddonScan {
